@@ -12,13 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import rclpy
-import rclpy.node
-# from rclpy.exceptions import ParameterAlreadyDeclaredException
-# from rcl_interfaces.msg import ParameterType
-from ament_index_python.packages import get_package_share_directory
-
-
+import argparse
 import xml.etree.ElementTree as ET
 from anytree import AnyNode, LevelOrderIter
 from anytree import RenderTree
@@ -32,27 +26,17 @@ import math
 import urdf_to_dh.kinematics_helpers as kh
 import urdf_to_dh.geometry_helpers as gh
 import urdf_to_dh.urdf_helpers as uh
-import urdf_to_dh.maker_helpers as mh
 
-class GenerateDhParams(rclpy.node.Node):
 
-    def __init__(self):
-        super().__init__('generate_dh_param_node')
+class GenerateDhParams:
 
-        self.declare_parameter('urdf_file')
+    def __init__(self, filepath: str):
         self.urdf_joints = {}
         self.urdf_links = {}
-        self.urdf_file = ''
+        self.urdf_file = filepath
         self.urdf_tree_nodes = []
         self.root_link = None
         self.verbose = False
-        self.marker_pub = mh.MarkerPublisher()
-
-    def InitializeDhNode(self):
-        self.get_logger().info('Initializing...')
-
-        self.urdf_file = self.get_parameter('urdf_file').get_parameter_value().string_value
-        self.get_logger().info('URDF file = %s' % self.urdf_file)
 
 
     def parse_urdf(self):
@@ -102,17 +86,129 @@ class GenerateDhParams(rclpy.node.Node):
             print("Error: Should only be one root link")
 
 
+    def produce_simplified_urdf(self, filepath: str):
+        joints_by_id = {}               # original joint data for each joint id
+        joint_tf_by_id = {}             # new joint transform by ID
+        joint_ancestor_id_by_id = {}    # for each moving joint, which moving joint (if any) comes before it
+
+        # Collapse fixed joints and preserve only moving joints
+        for node in LevelOrderIter(self.root_link):
+            if self.is_moving_joint(node):
+                current_joint = node
+
+                # Collapse the transforms of all the preceding fixed joints into this one so we can
+                # eliminate them
+                prior_fixed_joints = self.find_consecutive_ancestral_fixed_joints(current_joint)
+                prior_fixed_joints.reverse()    # start from farthest ancestor so we can walk down the tree
+                transform = np.eye(4)
+                for fixed_joint in prior_fixed_joints:
+                    transform = transform @ self.urdf_joints[fixed_joint.id]["tf"]
+                transform = transform @ self.urdf_joints[current_joint.id]["tf"]
+
+                # Find ancestral moving joint, if one exists
+                ancestral_moving_joint = self.find_ancestral_moving_joint(current_joint)
+                print(ancestral_moving_joint)
+
+                # Store this moving joint
+                joints_by_id[current_joint.id] = self.urdf_joints[current_joint.id]
+                joint_tf_by_id[current_joint.id] = transform
+                if ancestral_moving_joint is not None:
+                    joint_ancestor_id_by_id[current_joint.id] = ancestral_moving_joint.id
+
+        # Convert each transform into xyz and rpy parameters (axis shouldn't change because it is
+        # *local* to the joint)
+        joint_xyz_by_id = {}
+        joint_rpy_by_id = {}
+        for id, joint_data in joints_by_id.items():
+            transform = joint_tf_by_id[id]
+            xyz = transform[0:3,3]
+            rpy = kh.rotation_matrix_to_rpy(transform[0:3,0:3])
+            joint_xyz_by_id[id] = xyz
+            joint_rpy_by_id[id] = rpy
+
+        # Create a link following every joint
+        child_link_name_by_joint_id = {}
+        i = 1
+        for id, joint_data in joints_by_id.items():
+            child_link_name_by_joint_id[id] = f"link_{i}"
+            i += 1
+
+        # Assign a parent link to everyone. Root joint gets a parent link named "base_link"
+        parent_link_name_by_joint_id = {}
+        for id, joint_data in joints_by_id.items():
+            is_root = id not in joint_ancestor_id_by_id
+            if is_root:
+                parent_link_name_by_joint_id[id] = "base_link"
+            else:
+                joint_ancestor_id = joint_ancestor_id_by_id[id]
+                parent_link_name_by_joint_id[id] = child_link_name_by_joint_id[joint_ancestor_id]
+
+        # All link
+        all_link_names = set(list(parent_link_name_by_joint_id.values()) + list(child_link_name_by_joint_id.values()))
+
+        # Produce the URDF file contents. Links first, then joints.
+        contents = """<?xml version="1.0"?>
+<robot name="robot">
+"""
+        for name in all_link_names:
+            contents += f"  <link name=\"{name}\"></link>\n"
+        for id, joint_data in joints_by_id.items():
+            joint_type = joint_data["joint_type"]
+            xyz = joint_xyz_by_id[id]
+            rpy = joint_rpy_by_id[id]
+            axis = self.urdf_joints[id]["axis"]
+            limits = self.urdf_joints[id]["limits"]
+            parent_link_name = parent_link_name_by_joint_id[id]
+            child_link_name = child_link_name_by_joint_id[id]
+            contents += f"  <joint name=\"{id}\" type=\"{joint_type}\">\n"
+            contents += f"      <origin xyz=\"{xyz[0]} {xyz[1]} {xyz[2]}\" rpy=\"{rpy[0]} {rpy[1]} {rpy[2]}\" />\n"
+            contents += f"      <axis xyz=\"{axis[0]} {axis[1]} {axis[2]}\" />\n"
+            if limits is not None:
+                contents += f"      <limit lower=\"{limits['lower']}\" upper=\"{limits['upper']}\" velocity=\"{limits['velocity']}\" effort=\"{limits['effort']}\" />\n"
+            contents += f"      <parent link=\"{parent_link_name}\" />\n"
+            contents += f"      <child link=\"{child_link_name}\" />\n"
+            contents += f"  </joint>\n"
+
+        contents += "</robot>"
+
+        with open(filepath, "w") as fp:
+            fp.write(contents)
+        print(f"Wrote simplified URDF to: {filepath}")
+
+    # Returns a list of direct ancestral fixed joints up to and excluding the first moving joint.
+    # E.g., [ parent_joint, grandparent_joint, ... ]
+    # Links are not included.
+    def find_consecutive_ancestral_fixed_joints(self, node):
+        ancestors = []
+        next_node = node.parent
+        while (next_node is not None) and (not self.is_moving_joint(next_node)):
+            if self.is_fixed_joint(next_node):
+                ancestors.append(next_node)
+            next_node = next_node.parent
+        print(f"Ancestral fixed joints of {node.id}: {[ n.id for n in ancestors ]}")
+        return ancestors
+
+    def find_ancestral_moving_joint(self, node) -> AnyNode | None:
+        next_node = node.parent
+        while next_node is not None:
+            if self.is_moving_joint(next_node):
+                return next_node
+            next_node = next_node.parent
+        return None
+
+    def is_moving_joint(self, node):
+        return node.type == "joint" and self.urdf_joints[node.id]["joint_type"] != "fixed"
+
+    def is_fixed_joint(self, node):
+        return node.type == "joint" and self.urdf_joints[node.id]["joint_type"] == "fixed"
+
     def calculate_tfs_in_world_frame(self):
         print("Calculate world tfs:")
         for n in LevelOrderIter(self.root_link):
             if n.type == 'link' and n.parent != None:
                 print("\nget tf from ", n.parent.parent.id, " to ", n.id)
                 parent_tf_world = self.urdf_links[n.parent.parent.id]['abs_tf']
-                xyz = self.urdf_joints[n.parent.id]['xyz']
-                rpy = self.urdf_joints[n.parent.id]['rpy']
-                tf = np.eye(4)
-                tf[0:3, 0:3] = kh.get_extrinsic_rotation(rpy)
-                tf[0:3, 3] = xyz
+                tf = self.urdf_joints[n.parent.id]['tf']
                 self.urdf_links[n.id]['rel_tf'] = tf
 
                 abs_tf = np.eye(4)
@@ -138,6 +234,8 @@ class GenerateDhParams(rclpy.node.Node):
         print("process_order = \n", [urdf_node.id for urdf_node in LevelOrderIter(self.root_link)])
         robot_dh_params = []
 
+        # First pass: compute DH params for all joints relative to their parents, regardless of
+        # whether those parents are fixed joints or moveable joints
         for urdf_node in LevelOrderIter(self.root_link):
             if urdf_node.type == 'link' and self.urdf_links[urdf_node.id]['dh_found'] == False:
                 print("\n\nprocess dh params for ", urdf_node.id)
@@ -153,7 +251,7 @@ class GenerateDhParams(rclpy.node.Node):
 
                 # Find DH parameters
                 # Publish Joint axis for visual verification
-                self.marker_pub.publish_arrow(urdf_node.id, np.zeros(3), self.urdf_joints[urdf_node.parent.id]['axis'], [1.0, 0.0, 1.0, 0.2])
+                #self.marker_pub.publish_arrow(urdf_node.id, np.zeros(3), self.urdf_joints[urdf_node.parent.id]['axis'], [1.0, 0.0, 1.0, 0.2])
                 axis = np.matmul(link_to_parent_dh[0:3, 0:3], self.urdf_joints[urdf_node.parent.id]['axis'])
 
                 dh_params = self.get_joint_dh_params(link_to_parent_dh, axis)
@@ -164,10 +262,8 @@ class GenerateDhParams(rclpy.node.Node):
                 self.urdf_links[urdf_node.id]['dh_tf'] = dh_frame
 
                 self.urdf_links[urdf_node.id]['abs_dh_tf'] = abs_dh_frame
-                self.marker_pub.publish_frame('world', abs_dh_frame)
+                #self.marker_pub.publish_frame('world', abs_dh_frame)
                 robot_dh_params.append([urdf_node.parent.id, urdf_node.parent.parent.id, urdf_node.id] + list(dh_params.round(5)))
-
-
 
         pd_frame = pd.DataFrame(robot_dh_params, columns=['joint', 'parent', 'child', 'd', 'theta', 'r', 'alpha'])
         pd_frame['theta'] = pd_frame['theta'] * 180.0 / math.pi
@@ -176,7 +272,6 @@ class GenerateDhParams(rclpy.node.Node):
         print(pd_frame.to_csv())
         print("\nDH Parameters: (markdown)")
         print(pd_frame.to_markdown())
-
 
 
     def get_joint_dh_params(self, rel_link_frame, axis):
@@ -245,7 +340,8 @@ class GenerateDhParams(rclpy.node.Node):
 
     def process_intersection_case(self, origin, axis):
         dh_params = np.zeros(4)
-        dh_params[0] = gh.lines_intersect(np.zeros(3), np.array([0, 0, 1]), origin, axis)[1][0]
+        solution = gh.lines_intersect(np.zeros(3), np.array([0, 0, 1]), origin, axis)[1][0]
+        dh_params[0] = solution[0]
 
         zaxis = np.array([0., 0., 1.])
         xaxis = np.array([1., 0., 0.])
@@ -301,22 +397,16 @@ class GenerateDhParams(rclpy.node.Node):
         # print('dh params = ', dh_params)
         return dh_params
 
-
-def main():
-    print('Starting GenerateDhParams Node...')
-    rclpy.init()
-    node = GenerateDhParams()
-    node.InitializeDhNode()
-    node.parse_urdf()
-    node.calculate_tfs_in_world_frame()
-    node.calculate_dh_params()
-
-    try:
-        rclpy.spin(node)
-    except:
-        pass
-
-    rclpy.shutdown()
-
 if __name__ == '__main__':
-    main()
+    parser = argparse.ArgumentParser("generate_dh")
+    parser.add_argument("file", nargs="+")
+    parser.add_argument("--simplified-urdf", metavar="filepath", action="store", type=str, help="Prune fixed joints and return a chain of mobile joints only")
+    options = parser.parse_args()
+
+    dh_generator = GenerateDhParams(filepath=options.file[0])
+    dh_generator.parse_urdf()
+    if options.simplified_urdf:
+        dh_generator.produce_simplified_urdf(filepath=options.simplified_urdf)
+        exit()
+    dh_generator.calculate_tfs_in_world_frame()
+    dh_generator.calculate_dh_params()
